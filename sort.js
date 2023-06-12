@@ -1,10 +1,11 @@
 const fs = require('fs');
 const readline = require('readline');
-const { promisify } = require('util');
-const stream = require('stream');
 
 const availableMemory = 50 * 1024 * 1024; // ОЗУ
 const lineSize = 200; // Сколько байтов весит одна строка
+
+let globalIndex = {};
+let vsego = 0;
 
 async function sortFile(inputFilePath, outputFilePath) {
     const chunkSize = Math.floor(availableMemory / lineSize); // Количество строк во временном файле
@@ -17,112 +18,112 @@ async function sortFile(inputFilePath, outputFilePath) {
 
     let lines = [];
     let chunkCount = 0;
-
     rl.on('line', (line) => {
+        vsego++;
         lines.push(line);
 
-        if (lines.length === chunkSize) {
+        if (lines.length >= chunkSize) {
             lines.sort();
-
-            const tempFilePath = `temp_${chunkCount}.txt`;
-            const writeStream = fs.createWriteStream(tempFilePath, { flags: 'a' });
-            writeStream.write(lines.join('\n') + '\n');
-            writeStream.end();
+            globalIndex[chunkCount] = lines[0];
+            const tempFilePath = `${chunkCount}.txt`;
+            fs.writeFileSync(tempFilePath, lines.join('\n') + '\n', { flag: 'a' });
 
             lines = [];
             chunkCount++;
         }
     });
 
-    rl.on('close', () => {
+    rl.on('close', async () => {
         if (lines.length > 0) {
             lines.sort();
-
-            const tempFilePath = `temp_${chunkCount}.txt`;
-            const writeStream = fs.createWriteStream(tempFilePath, { flags: 'a' });
-            writeStream.write(lines.join('\n') + '\n');
-            writeStream.end();
+            globalIndex[chunkCount] = lines[0];
+            const tempFilePath = `${chunkCount}.txt`;
+            fs.writeFileSync(tempFilePath, lines.join('\n') + '\n', { flag: 'a' });
 
             lines = [];
             chunkCount++;
         }
+        readStream.close();
+        await mergeChunks(chunkCount, outputFilePath);
 
-        mergeChunks(chunkCount, outputFilePath);
+        console.log('Отсортирован');
     });
 }
 
-async function mergeChunks(chunkCount, outputFilePath) {
-    const readStreams = [];
+async function deleteLineInChunk(chunk) {
+    return new Promise((resolve, reject) => {
+        const tempFilePath = `${chunk}.txt`;
+        const newFilePath = `${chunk}_new.txt`;
 
-    for (let i = 0; i < chunkCount; i++) {
-        const tempFilePath = `temp_${i}.txt`;
+        const lines = [];
+        let nextLine = null;
+
         const readStream = fs.createReadStream(tempFilePath);
-        readStreams.push(readStream);
-    }
 
-    const writeStream = fs.createWriteStream(outputFilePath);
-    const mergeStream = new stream.PassThrough();
-
-    let isFinished = false;
-
-    mergeStream.on('drain', () => {
-        if (!isFinished) {
-            readNextLine();
-        }
-    });
-
-    mergeStream.pipe(writeStream);
-
-    let currentStreamIndex = 0;
-    let currentLine = '';
-
-    function readNextLine() {
-        const currentStream = readStreams[currentStreamIndex];
         const rl = readline.createInterface({
-            input: currentStream,
+            input: readStream,
             crlfDelay: Infinity
         });
 
         rl.on('line', (line) => {
-            if (currentLine === '') {
-                currentLine = line;
-            } else {
-                if (currentLine <= line) {
-                    mergeStream.write(currentLine + '\n');
-                    currentLine = line;
-                } else {
-                    mergeStream.write(line + '\n');
-                }
-            }
+            lines.push(line);
         });
 
         rl.on('close', () => {
-            currentStreamIndex++;
-            if (currentStreamIndex < readStreams.length) {
-                readNextLine();
-            } else {
-                if (currentLine !== '') {
-                    mergeStream.write(currentLine + '\n');
+            if (lines.length > 0) {
+                lines.shift();
+                if (lines.length) {
+                    nextLine = lines[0];
                 }
-                mergeStream.end();
-                isFinished = true;
+            } else {
+                nextLine = null;
             }
+
+            const newData = lines.join('\n');
+            fs.writeFileSync(newFilePath, newData, { encoding: 'utf8' });
+
+            // Закрытие потока чтения
+            readStream.close();
+
+            // Удаление исходного файла
+            fs.unlink(tempFilePath, (error) => {
+                if (error) {
+                    console.error('Ошибка при удалении исходного файла:', error);
+                }
+            });
+
+            // Переименование нового файла в исходное имя файла
+            fs.rename(newFilePath, tempFilePath, (error) => {
+                if (error) {
+                    console.error('Ошибка при переименовании файла:', error);
+                }
+            });
+            if (nextLine === null || nextLine === undefined) {
+                delete globalIndex[chunk];
+            } else {
+                globalIndex[chunk] = nextLine;
+            }
+            resolve();
         });
+    });
+}
+
+let ost = 0;
+
+async function mergeChunks(chunkCount, outputFilePath) {
+    const writeStream = fs.createWriteStream(outputFilePath);
+
+    while (Object.keys(globalIndex).length !== 0) {
+        console.log(globalIndex);
+        console.log(`${(ost / vsego) * 1000} %`);
+        const entries = Object.entries(globalIndex);
+        const [chunk, minValue] = entries.reduce((min, entry) => (entry[1] < min[1] ? entry : min));
+        writeStream.write(minValue + '\n');
+        ost++;
+        await deleteLineInChunk(chunk);
     }
 
-    readNextLine();
-
-    await new Promise((resolve, reject) => {
-        mergeStream.on('finish', resolve);
-        mergeStream.on('error', reject);
-    });
-
-    readStreams.forEach((readStream) => {
-        readStream.close();
-        fs.unlinkSync(readStream.path);
-    });
-
-    console.log('Файл отсортирован');
+    writeStream.close();
 }
 
 const inputFilePath = 'input.txt';
